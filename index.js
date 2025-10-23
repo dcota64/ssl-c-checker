@@ -1,48 +1,65 @@
-import express from "express";
-import cors from "cors";
-import sslChecker from "ssl-checker";
+import tls from "tls";
 import dns from "dns/promises";
+import net from "net";
+import http from "http";
 
-const app = express();
-app.use(cors());
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const host = url.searchParams.get("host");
+  const port = Number(url.searchParams.get("port") || 443);
 
-app.get("/", async (req, res) => {
-  const host = req.query.host;
-  const port = Number(req.query.port) || 443;
+  res.setHeader("content-type", "application/json");
+  res.setHeader("access-control-allow-origin", "*");
 
   if (!host) {
-    return res.status(400).json({ error: "Falta el parámetro 'host'" });
+    res.statusCode = 400;
+    return res.end(JSON.stringify({ error: "Falta el parámetro 'host'" }));
   }
 
   try {
-    // Resolver IP
-    const ips = await dns.lookup(host, { all: true });
-    const ip = ips[0]?.address || null;
+    const ips = await dns.resolve4(host);
+    const ip = ips[0];
 
-    // Obtener datos SSL
-    const sslData = await sslChecker(host, { method: "GET", port });
+    const socket = tls.connect(
+      { host, port, servername: host, timeout: 5000 },
+      () => {
+        const cert = socket.getPeerCertificate(true);
 
-    return res.json({
-      host,
-      ip,
-      port,
-      valid_from: sslData.valid_from,
-      valid_to: sslData.valid_to,
-      days_remaining: sslData.days_remaining,
-      valid: sslData.valid,
-      issuer: sslData.issuer,
-      subject: sslData.subject,
-      has_https: sslData.valid,
+        if (!cert || !cert.valid_to) throw new Error("No se pudo obtener el certificado SSL.");
+
+        const validFrom = new Date(cert.valid_from);
+        const validTo = new Date(cert.valid_to);
+        const now = new Date();
+        const daysRemaining = Math.floor((validTo - now) / (1000 * 60 * 60 * 24));
+        const isValidNow = validFrom <= now && now <= validTo;
+
+        const data = {
+          ip,
+          host,
+          port,
+          valid_from: cert.valid_from,
+          valid_to: cert.valid_to,
+          days_remaining: daysRemaining,
+          issuer: cert.issuer?.O || cert.issuer?.CN || null,
+          subject: cert.subject?.CN || null,
+          is_valid_now: isValidNow,
+          has_https: true,
+        };
+
+        res.end(JSON.stringify(data, null, 2));
+        socket.end();
+      }
+    );
+
+    socket.on("error", (err) => {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: err.message, has_https: false }));
     });
   } catch (err) {
-    return res.status(500).json({
-      error: err.message,
-      has_https: false,
-    });
+    res.statusCode = 500;
+    res.end(JSON.stringify({ error: err.message, has_https: false }));
   }
 });
 
-const portServer = process.env.PORT || 8080;
-app.listen(portServer, () => {
-  console.log(`SSL Checker API corriendo en puerto ${portServer}`);
-});
+server.listen(process.env.PORT || 8080);
+console.log("✅ SSL Checker API corriendo en puerto", process.env.PORT || 8080);
